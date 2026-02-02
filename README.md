@@ -2,8 +2,8 @@
 
 A sentiment-based stock trading bot for the Indonesian Stock Exchange (IHSG/IDX). Sentimeter crawls financial news from Indonesian portals, extracts stock tickers using AI, fetches market data, and generates daily buy recommendations with entry prices, stop losses, and target prices.
 
-[Sentimeter 1](/assets/sentimeter-1.png)
-[Sentimeter 2](/assets/sentimeter-2.png)
+![Sentimeter 1](/assets/sentimeter-1.png)
+![Sentimeter 2](/assets/sentimeter-2.png)
 
 ## Table of Contents
 
