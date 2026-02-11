@@ -1,10 +1,14 @@
 /**
  * Avoid Cache
  *
- * In-memory cache for AVOID/unrecommended tickers.
+ * File-backed cache for AVOID/unrecommended tickers.
+ * Persists to disk so data survives server restarts.
  * These are high-risk/high-return stocks that we display
  * temporarily but do NOT save as positions.
  */
+
+import { join } from "path";
+import { mkdirSync } from "fs";
 
 export interface AvoidItem {
   ticker: string;
@@ -25,33 +29,60 @@ export interface AvoidItem {
   detectedAt: string;
 }
 
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+interface CacheFile {
+  updatedAt: string;
+  items: AvoidItem[];
+}
 
-let avoidItems: AvoidItem[] = [];
-let lastUpdated: number = 0;
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CACHE_DIR = join(import.meta.dir, "../../data");
+const CACHE_PATH = join(CACHE_DIR, "avoid-cache.json");
+
+function ensureDir(): void {
+  mkdirSync(CACHE_DIR, { recursive: true });
+}
+
+function readFromDisk(): CacheFile | null {
+  try {
+    const { readFileSync } = require("fs") as typeof import("fs");
+    const text = readFileSync(CACHE_PATH, "utf-8");
+    return JSON.parse(text) as CacheFile;
+  } catch {
+    return null;
+  }
+}
+
+function writeToDisk(data: CacheFile): void {
+  ensureDir();
+  const { writeFileSync } = require("fs") as typeof import("fs");
+  writeFileSync(CACHE_PATH, JSON.stringify(data, null, 2));
+}
 
 export function setAvoidItems(items: AvoidItem[]): void {
-  avoidItems = items;
-  lastUpdated = Date.now();
+  const data: CacheFile = { updatedAt: new Date().toISOString(), items };
+  writeToDisk(data);
 }
 
 export function addAvoidItem(item: AvoidItem): void {
-  // Prevent duplicates by ticker
-  avoidItems = avoidItems.filter((i) => i.ticker !== item.ticker);
-  avoidItems.push(item);
-  lastUpdated = Date.now();
+  const existing = getAvoidItems();
+  const filtered = existing.filter((i) => i.ticker !== item.ticker);
+  filtered.push(item);
+  setAvoidItems(filtered);
 }
 
 export function getAvoidItems(): AvoidItem[] {
-  // Return empty if cache is stale
-  if (Date.now() - lastUpdated > CACHE_TTL_MS) {
-    avoidItems = [];
+  const data = readFromDisk();
+  if (!data) return [];
+
+  const age = Date.now() - new Date(data.updatedAt).getTime();
+  if (age > CACHE_TTL_MS) {
     return [];
   }
-  return [...avoidItems];
+
+  return data.items;
 }
 
 export function clearAvoidItems(): void {
-  avoidItems = [];
-  lastUpdated = 0;
+  const data: CacheFile = { updatedAt: new Date(0).toISOString(), items: [] };
+  writeToDisk(data);
 }

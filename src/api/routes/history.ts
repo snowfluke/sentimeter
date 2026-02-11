@@ -135,8 +135,9 @@ function getFilteredRecommendations(
 }
 
 function calculateStats(params: HistoryParams): HistoryStats {
-  // Build where clause for closed recommendations
-  let whereClause = "WHERE status IN ('target_hit', 'sl_hit', 'expired')";
+  // Only count positions that were actually entered (have P&L data).
+  // Expired-from-pending positions have no P&L and should not skew stats.
+  let whereClause = "WHERE status IN ('target_hit', 'sl_hit', 'expired') AND profit_loss_pct IS NOT NULL";
 
   if (params.ticker) {
     const ticker = params.ticker.toUpperCase().replace(/'/g, "''");
@@ -168,20 +169,18 @@ function calculateStats(params: HistoryParams): HistoryStats {
     avg_return: number | null;
   };
 
-  // Get best pick
   const bestQuery = db.prepare(`
     SELECT ticker, profit_loss_pct
     FROM recommendations
-    ${whereClause} AND profit_loss_pct IS NOT NULL
+    ${whereClause}
     ORDER BY profit_loss_pct DESC
     LIMIT 1
   `);
 
-  // Get worst pick
   const worstQuery = db.prepare(`
     SELECT ticker, profit_loss_pct
     FROM recommendations
-    ${whereClause} AND profit_loss_pct IS NOT NULL
+    ${whereClause}
     ORDER BY profit_loss_pct ASC
     LIMIT 1
   `);

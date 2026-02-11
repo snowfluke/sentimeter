@@ -2,10 +2,13 @@
  * Summary Table
  *
  * Compact table combining new recommendations and active positions
- * for easy screenshotting and sharing.
+ * for easy screenshotting and sharing. Sorted by P&L descending.
  */
 
+import { useState } from "react";
 import type { RecommendationItem, ActivePositionItem } from "@/lib/types";
+
+const PAGE_SIZE = 10;
 
 interface SummaryTableProps {
   recommendations: RecommendationItem[];
@@ -13,9 +16,18 @@ interface SummaryTableProps {
   date: string;
 }
 
+type SignalType =
+  | "BUY"
+  | "HOLD"
+  | "NEAR_TP"
+  | "NEAR_SL"
+  | "CONSIDER_TP"
+  | "CONSIDER_SL"
+  | "WAITING";
+
 type TableRow = {
   ticker: string;
-  type: "NEW" | "HOLD";
+  signal: SignalType;
   entry: number;
   current: number;
   target: number;
@@ -23,7 +35,6 @@ type TableRow = {
   pnl: number | null;
   score: number | null;
   days: number;
-  status: string;
 };
 
 function formatPrice(price: number): string {
@@ -43,19 +54,52 @@ function getPnlColor(pnl: number | null): string {
   return "text-gray-600";
 }
 
-function getTypeColor(type: "NEW" | "HOLD"): string {
-  return type === "NEW"
-    ? "bg-blue-100 text-blue-800"
-    : "bg-amber-100 text-amber-800";
+const SIGNAL_STYLES: Record<SignalType, string> = {
+  BUY: "bg-blue-100 text-blue-800",
+  HOLD: "bg-amber-100 text-amber-800",
+  NEAR_TP: "bg-green-100 text-green-800",
+  NEAR_SL: "bg-red-100 text-red-800",
+  CONSIDER_TP: "bg-emerald-50 text-emerald-700",
+  CONSIDER_SL: "bg-orange-50 text-orange-700",
+  WAITING: "bg-gray-100 text-gray-600",
+};
+
+const SIGNAL_LABELS: Record<SignalType, string> = {
+  BUY: "BUY",
+  HOLD: "HOLD",
+  NEAR_TP: "Near TP",
+  NEAR_SL: "Near SL",
+  CONSIDER_TP: "Take Profit",
+  CONSIDER_SL: "Cut Loss",
+  WAITING: "Waiting",
+};
+
+function deriveSignal(pos: ActivePositionItem): SignalType {
+  const current = pos.currentPrice ?? pos.entryPrice;
+  const distToTarget = ((pos.targetPrice - current) / current) * 100;
+  const distToSl = ((current - pos.stopLoss) / current) * 100;
+
+  if (pos.status === "pending") return "WAITING";
+
+  // Within 2% of target → near TP
+  if (distToTarget <= 2 && distToTarget > 0) return "NEAR_TP";
+  // Already past target → consider taking profit
+  if (distToTarget <= 0) return "CONSIDER_TP";
+  // Within 2% of stop loss → near SL
+  if (distToSl <= 2 && distToSl > 0) return "NEAR_SL";
+  // Already below stop loss → cut loss
+  if (distToSl <= 0) return "CONSIDER_SL";
+
+  return "HOLD";
 }
 
 export function SummaryTable({ recommendations, activePositions, date }: SummaryTableProps) {
-  // Transform data into unified rows
+  const [page, setPage] = useState(0);
+
   const rows: TableRow[] = [
-    // New recommendations first
     ...recommendations.map((rec): TableRow => ({
       ticker: rec.ticker,
-      type: "NEW",
+      signal: "BUY",
       entry: rec.entryPrice,
       current: rec.currentPrice,
       target: rec.targetPrice,
@@ -63,12 +107,10 @@ export function SummaryTable({ recommendations, activePositions, date }: Summary
       pnl: null,
       score: rec.overallScore,
       days: 0,
-      status: "Pending Entry",
     })),
-    // Then active positions
     ...activePositions.map((pos): TableRow => ({
       ticker: pos.ticker,
-      type: "HOLD",
+      signal: deriveSignal(pos),
       entry: pos.entryPrice,
       current: pos.currentPrice ?? pos.entryPrice,
       target: pos.targetPrice,
@@ -76,13 +118,23 @@ export function SummaryTable({ recommendations, activePositions, date }: Summary
       pnl: pos.unrealizedPnlPct,
       score: null,
       days: pos.daysHeld,
-      status: pos.status === "entry_hit" ? "In Position" : "Waiting",
     })),
   ];
+
+  // Sort: positions with P&L first (descending), then new recs by score
+  rows.sort((a, b) => {
+    if (a.pnl !== null && b.pnl !== null) return b.pnl - a.pnl;
+    if (a.pnl !== null) return -1;
+    if (b.pnl !== null) return 1;
+    return (b.score ?? 0) - (a.score ?? 0);
+  });
 
   if (rows.length === 0) {
     return null;
   }
+
+  const totalPages = Math.ceil(rows.length / PAGE_SIZE);
+  const pagedRows = rows.slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE);
 
   const formattedDate = new Date(date).toLocaleDateString("id-ID", {
     weekday: "short",
@@ -105,7 +157,7 @@ export function SummaryTable({ recommendations, activePositions, date }: Summary
           <thead className="bg-gray-50 border-b border-gray-200">
             <tr>
               <th className="px-3 py-2 text-left font-semibold text-gray-700">Ticker</th>
-              <th className="px-3 py-2 text-center font-semibold text-gray-700">Type</th>
+              <th className="px-3 py-2 text-center font-semibold text-gray-700">Signal</th>
               <th className="px-3 py-2 text-right font-semibold text-gray-700">Entry</th>
               <th className="px-3 py-2 text-right font-semibold text-gray-700">Current</th>
               <th className="px-3 py-2 text-right font-semibold text-gray-700">Target</th>
@@ -115,12 +167,12 @@ export function SummaryTable({ recommendations, activePositions, date }: Summary
             </tr>
           </thead>
           <tbody className="divide-y divide-gray-100">
-            {rows.map((row, idx) => (
+            {pagedRows.map((row, idx) => (
               <tr key={`${row.ticker}-${idx}`} className="hover:bg-gray-50">
                 <td className="px-3 py-2 font-bold text-gray-900">{row.ticker}</td>
                 <td className="px-3 py-2 text-center">
-                  <span className={`inline-block px-2 py-0.5 rounded text-xs font-medium ${getTypeColor(row.type)}`}>
-                    {row.type}
+                  <span className={`inline-block px-2 py-0.5 rounded text-xs font-medium ${SIGNAL_STYLES[row.signal]}`}>
+                    {SIGNAL_LABELS[row.signal]}
                   </span>
                 </td>
                 <td className="px-3 py-2 text-right text-gray-700">{formatPrice(row.entry)}</td>
@@ -138,7 +190,27 @@ export function SummaryTable({ recommendations, activePositions, date }: Summary
       <div className="bg-gray-50 px-4 py-2 border-t border-gray-200">
         <div className="flex items-center justify-between text-xs text-gray-500">
           <span>{recommendations.length} new + {activePositions.length} active = {rows.length} total</span>
-          <span>sentimeter.app</span>
+          {totalPages > 1 ? (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setPage((p) => Math.max(0, p - 1))}
+                disabled={page === 0}
+                className="px-2 py-0.5 rounded border border-gray-300 disabled:opacity-40 hover:bg-gray-100"
+              >
+                Prev
+              </button>
+              <span>{page + 1}/{totalPages}</span>
+              <button
+                onClick={() => setPage((p) => Math.min(totalPages - 1, p + 1))}
+                disabled={page >= totalPages - 1}
+                className="px-2 py-0.5 rounded border border-gray-300 disabled:opacity-40 hover:bg-gray-100"
+              >
+                Next
+              </button>
+            </div>
+          ) : (
+            <span>sentimeter.app</span>
+          )}
         </div>
       </div>
     </div>

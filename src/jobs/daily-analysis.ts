@@ -4,22 +4,23 @@
  * Runs the complete analysis pipeline:
  * 1. Crawl news from all portals
  * 2. Extract tickers using Gemini
- * 3. Fetch market data from Yahoo Finance
- * 4. Generate recommendations
+ * 3. Aggregate top tickers
+ * 4. Fetch market data from Yahoo Finance & generate recommendations
  * 5. Update prediction statuses
+ *
+ * Supports step-level caching (1-hour TTL) so failed runs
+ * can resume from the last completed step.
  */
 
 import { crawlAllPortals } from "../lib/crawler/index.ts";
-import type { CrawlSummary, RawArticle } from "../lib/crawler/types.ts";
+import type { CrawlSummary } from "../lib/crawler/types.ts";
 import { extractTickersFromNews } from "../lib/analyzer/ticker-extractor.ts";
 import { analyzeStock } from "../lib/analyzer/stock-analyzer.ts";
-import type { NewsArticleInput, StockAnalysisInput } from "../lib/analyzer/types.ts";
+import type { NewsArticleInput, StockAnalysisInput, ExtractedTicker, TickerExtractionResult } from "../lib/analyzer/types.ts";
 import { fetchCurrentQuote, fetchPriceHistory, calculateTechnicalSummary } from "../lib/market-data/technical.ts";
 import { fetchFundamentals } from "../lib/market-data/fundamental.ts";
 import { updateAllPredictions, getTrackedPredictions } from "../lib/prediction-tracker/updater.ts";
 import {
-  insertNewsArticle,
-  insertNewsTicker,
   insertRecommendation,
   upsertStockFundamental,
   startJobExecution,
@@ -29,14 +30,21 @@ import {
   getRecentNewsArticles,
   getActiveTickers,
 } from "../lib/database/queries.ts";
-import type { JobSchedule, NewsArticleInsert, NewsTickerInsert } from "../lib/database/types.ts";
-import { generateContentHash } from "../lib/crawler/deduplicator.ts";
+import type { JobSchedule } from "../lib/database/types.ts";
 import { initDatabase } from "../lib/database/schema.ts";
+import { getStepCache, setStepCache, getResumeStep, clearStepCache } from "../lib/step-cache.ts";
 
 const MIN_OVERALL_SCORE = 65;
 const MAX_RECOMMENDATIONS_PER_RUN = 5;
 const MAX_NEWS_AGE_DAYS = 1;
-const MAX_CONTENT_LENGTH = 200; // Only use first 200 chars as description
+const MAX_CONTENT_LENGTH = 200;
+const TOTAL_STEPS = 5;
+const CACHEABLE_STEPS = 3;
+
+interface Step1Cache {
+  totalNewArticles: number;
+  successfulPortals: number;
+}
 
 interface JobResult {
   success: boolean;
@@ -52,7 +60,6 @@ export async function runDailyAnalysis(schedule: JobSchedule, force: boolean = f
   const today = new Date().toISOString().slice(0, 10);
   const errors: string[] = [];
 
-  // Check if already run today (skip if force flag is set)
   if (!force && hasJobRunToday(schedule)) {
     console.log(`WARNING: ${schedule} analysis already completed for today`);
     console.log(`   Use --force to run anyway`);
@@ -71,68 +78,86 @@ export async function runDailyAnalysis(schedule: JobSchedule, force: boolean = f
     console.log(`FORCE MODE: Running ${schedule} analysis despite previous run`);
   }
 
-  // Start job
   const jobId = startJobExecution({ schedule, executionDate: today });
-  console.log(`🚀 Starting ${schedule} analysis (Job ID: ${jobId})`);
+  console.log(`Starting ${schedule} analysis (Job ID: ${jobId})`);
 
   try {
-    // Step 1: Crawl news
-    console.log("\n📰 Step 1: Crawling news portals...");
-    const crawlSummary: CrawlSummary = await crawlAllPortals();
-    let articlesProcessed = crawlSummary.totalNewArticles;
-    console.log(`   ✓ Processed ${articlesProcessed} new articles from ${crawlSummary.successfulPortals} portals`);
+    // Determine resume point from cached steps
+    const resumeFrom = await getResumeStep(today, schedule, CACHEABLE_STEPS);
+    if (resumeFrom > 1) {
+      console.log(`\n   Resuming from step ${resumeFrom} (steps 1-${resumeFrom - 1} cached)`);
+    }
 
-    // Collect articles for ticker extraction (only recent ones)
+    // Step 1: Crawl news
+    let crawlStats: Step1Cache;
+    if (resumeFrom <= 1) {
+      console.log("\n   Step 1: Crawling news portals...");
+      const crawlSummary: CrawlSummary = await crawlAllPortals();
+      crawlStats = { totalNewArticles: crawlSummary.totalNewArticles, successfulPortals: crawlSummary.successfulPortals };
+      await setStepCache(today, schedule, 1, crawlStats);
+      console.log(`   Done: ${crawlStats.totalNewArticles} new articles from ${crawlStats.successfulPortals} portals`);
+    } else {
+      console.log("\n   Step 1: Using cached crawl results");
+      crawlStats = (await getStepCache<Step1Cache>(today, schedule, 1)) ?? { totalNewArticles: 0, successfulPortals: 0 };
+      console.log(`   Cached: ${crawlStats.totalNewArticles} articles from ${crawlStats.successfulPortals} portals`);
+    }
+
     const recentArticles = getRecentNewsArticles(MAX_NEWS_AGE_DAYS);
-    const now = new Date();
-    const cutoffDate = new Date(now.getTime() - MAX_NEWS_AGE_DAYS * 24 * 60 * 60 * 1000);
+    const cutoffDate = new Date(Date.now() - MAX_NEWS_AGE_DAYS * 24 * 60 * 60 * 1000);
 
     const articlesForExtraction: NewsArticleInput[] = recentArticles
       .filter((article) => {
-        if (!article.publishedAt) return true; // Include if no date
-        const pubDate = new Date(article.publishedAt);
-        return pubDate >= cutoffDate;
+        if (!article.publishedAt) return true;
+        return new Date(article.publishedAt) >= cutoffDate;
       })
       .map((article) => ({
         title: article.title,
-        content: article.content?.slice(0, MAX_CONTENT_LENGTH) ?? null, // Only first 200 chars
+        content: article.content?.slice(0, MAX_CONTENT_LENGTH) ?? null,
         portal: article.portal,
         publishedAt: article.publishedAt ? new Date(article.publishedAt) : null,
       }));
 
-    console.log(`   ✓ Filtered to ${articlesForExtraction.length} articles from last ${MAX_NEWS_AGE_DAYS} days`);
+    console.log(`   Filtered to ${articlesForExtraction.length} articles from last ${MAX_NEWS_AGE_DAYS} days`);
 
     // Step 2: Extract tickers
-    console.log("\n🔍 Step 2: Extracting tickers with AI...");
-    const tickerResult = await extractTickersFromNews(articlesForExtraction);
-    const tickersFound = tickerResult.tickers.length;
-    console.log(`   ✓ Found ${tickersFound} unique ticker mentions`);
-
-    // Save tickers to database (we don't have article IDs readily available, so skip for now)
-    // In a real implementation, we'd track article IDs during crawling
-
-    // Step 3: Aggregate tickers by relevance and sentiment
-    console.log("\n📊 Step 3: Analyzing top tickers...");
-
-    // Get tickers with active positions to exclude them
-    const activeTickers = new Set(getActiveTickers());
-    if (activeTickers.size > 0) {
-      console.log(`   ℹ️  Excluding ${activeTickers.size} tickers with active positions: ${[...activeTickers].join(", ")}`);
+    let tickerResult: TickerExtractionResult;
+    if (resumeFrom <= 2) {
+      console.log("\n   Step 2: Extracting tickers with AI...");
+      tickerResult = await extractTickersFromNews(articlesForExtraction);
+      await setStepCache(today, schedule, 2, tickerResult);
+      console.log(`   Done: ${tickerResult.tickers.length} unique ticker mentions`);
+    } else {
+      console.log("\n   Step 2: Using cached ticker extraction");
+      const cached = await getStepCache<TickerExtractionResult>(today, schedule, 2);
+      tickerResult = cached ?? { tickers: [], articlesAnalyzed: 0, processingTimeMs: 0 };
+      console.log(`   Cached: ${tickerResult.tickers.length} ticker mentions`);
     }
 
-    const topTickers = tickerResult.tickers
-      .filter((t) => t.sentiment > 0.2) // Only positive sentiment
-      .filter((t) => !activeTickers.has(t.ticker.toUpperCase())) // Exclude active positions
-      .sort((a, b) => b.relevance - a.relevance || b.sentiment - a.sentiment)
-      .slice(0, 10);
+    // Step 3: Aggregate tickers
+    let topTickers: ExtractedTicker[];
+    if (resumeFrom <= 3) {
+      console.log("\n   Step 3: Analyzing top tickers...");
+      const activeTickers = new Set(getActiveTickers());
+      if (activeTickers.size > 0) {
+        console.log(`   Excluding ${activeTickers.size} tickers with active positions: ${[...activeTickers].join(", ")}`);
+      }
+      topTickers = tickerResult.tickers
+        .filter((t) => t.sentiment > 0.2)
+        .filter((t) => !activeTickers.has(t.ticker.toUpperCase()))
+        .sort((a, b) => b.relevance - a.relevance || b.sentiment - a.sentiment)
+        .slice(0, 10);
+      await setStepCache(today, schedule, 3, topTickers);
+      console.log(`   Top tickers: ${topTickers.map((t) => t.ticker).join(", ")}`);
+    } else {
+      console.log("\n   Step 3: Using cached top tickers");
+      topTickers = (await getStepCache<ExtractedTicker[]>(today, schedule, 3)) ?? [];
+      console.log(`   Cached: ${topTickers.map((t) => t.ticker).join(", ") || "none"}`);
+    }
 
-    console.log(`   ✓ Top tickers: ${topTickers.map((t) => t.ticker).join(", ")}`);
-
-    // Step 4: Fetch market data and generate recommendations
-    console.log("\n💹 Step 4: Fetching market data and generating recommendations...");
+    // Step 4: Fetch market data and generate recommendations (always fresh)
+    console.log("\n   Step 4: Fetching market data and generating recommendations...");
     const recommendations: Array<{ ticker: string; score: number }> = [];
 
-    // Get active predictions for context
     const activePredictions = await getTrackedPredictions();
     const activePredictionInputs = activePredictions
       .filter((p) => p.status === "pending" || p.status === "entry_hit")
@@ -153,15 +178,13 @@ export async function runDailyAnalysis(schedule: JobSchedule, force: boolean = f
       try {
         console.log(`   Processing ${ticker}...`);
 
-        // Fetch quote
         const quoteResult = await fetchCurrentQuote(ticker);
         if (!quoteResult.success || !quoteResult.data) {
-          console.log(`   ⚠️  No quote for ${ticker}: ${quoteResult.error}`);
+          console.log(`   Warning: No quote for ${ticker}: ${quoteResult.error}`);
           continue;
         }
         const quote = quoteResult.data;
 
-        // Fetch fundamentals
         const fundamentalsResult = await fetchFundamentals(ticker);
         const fundamentals = fundamentalsResult.success ? fundamentalsResult.data : null;
 
@@ -179,16 +202,14 @@ export async function runDailyAnalysis(schedule: JobSchedule, force: boolean = f
           });
         }
 
-        // Fetch technicals
         const historyResult = await fetchPriceHistory(ticker, "3mo");
         if (!historyResult.success || !historyResult.data) {
-          console.log(`   ⚠️  No price history for ${ticker}`);
+          console.log(`   Warning: No price history for ${ticker}`);
           continue;
         }
 
         const technical = calculateTechnicalSummary(ticker, historyResult.data, quote.price);
 
-        // Build analysis input
         const analysisInput: StockAnalysisInput = {
           ticker,
           companyName: fundamentals?.companyName ?? ticker,
@@ -218,7 +239,6 @@ export async function runDailyAnalysis(schedule: JobSchedule, force: boolean = f
           activePredictions: activePredictionInputs.filter((p) => p.ticker === ticker),
         };
 
-        // Generate recommendation
         const analysis = await analyzeStock(analysisInput);
 
         if (analysis && analysis.overallScore >= MIN_OVERALL_SCORE && analysis.action === "BUY") {
@@ -230,6 +250,7 @@ export async function runDailyAnalysis(schedule: JobSchedule, force: boolean = f
             stopLoss: analysis.stopLoss,
             targetPrice: analysis.targetPrice,
             maxHoldDays: analysis.maxHoldDays,
+            orderType: analysis.orderType,
             sentimentScore: analysis.sentimentScore,
             fundamentalScore: analysis.fundamentalScore,
             technicalScore: analysis.technicalScore,
@@ -240,58 +261,60 @@ export async function runDailyAnalysis(schedule: JobSchedule, force: boolean = f
             analysisSummary: analysis.analysisSummary,
           });
           recommendations.push({ ticker, score: analysis.overallScore });
-          console.log(`   ✓ ${ticker}: Score ${analysis.overallScore.toFixed(1)} - RECOMMENDED`);
+          console.log(`   ${ticker}: Score ${analysis.overallScore.toFixed(1)} - RECOMMENDED (${analysis.orderType})`);
         } else if (analysis) {
-          console.log(`   ○ ${ticker}: Score ${analysis.overallScore.toFixed(1)} - ${analysis.action}`);
+          console.log(`   ${ticker}: Score ${analysis.overallScore.toFixed(1)} - ${analysis.action}`);
         } else {
-          console.log(`   ○ ${ticker}: Analysis failed`);
+          console.log(`   ${ticker}: Analysis failed`);
         }
 
-        // Rate limit
         await new Promise((r) => setTimeout(r, 1000));
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         errors.push(`${ticker}: ${msg}`);
-        console.log(`   ✗ ${ticker}: ${msg}`);
+        console.log(`   Error ${ticker}: ${msg}`);
       }
 
       if (recommendations.length >= MAX_RECOMMENDATIONS_PER_RUN) break;
     }
 
-    console.log(`   ✓ Generated ${recommendations.length} recommendations`);
+    console.log(`   Generated ${recommendations.length} recommendations`);
 
-    // Step 5: Update prediction statuses
-    console.log("\n🔄 Step 5: Updating prediction statuses...");
+    // Step 5: Update prediction statuses (always fresh)
+    console.log("\n   Step 5: Updating prediction statuses...");
     const updateResult = await updateAllPredictions();
     const predictionsUpdated = updateResult.updated;
-    console.log(`   ✓ Updated ${predictionsUpdated} predictions`);
+    console.log(`   Updated ${predictionsUpdated} predictions`);
 
-    // Complete job
+    // Clear step cache after successful completion
+    await clearStepCache(today, schedule);
+
     completeJobExecution(jobId, {
-      articlesProcessed,
-      tickersExtracted: tickersFound,
+      articlesProcessed: crawlStats.totalNewArticles,
+      tickersExtracted: tickerResult.tickers.length,
       recommendationsGenerated: recommendations.length,
     });
 
-    console.log(`\n✅ ${schedule} analysis completed successfully!`);
-    console.log(`   Articles: ${articlesProcessed}`);
-    console.log(`   Tickers: ${tickersFound}`);
+    console.log(`\n${schedule} analysis completed successfully!`);
+    console.log(`   Articles: ${crawlStats.totalNewArticles}`);
+    console.log(`   Tickers: ${tickerResult.tickers.length}`);
     console.log(`   Recommendations: ${recommendations.length}`);
     console.log(`   Predictions updated: ${predictionsUpdated}`);
 
     return {
       success: true,
       jobId,
-      articlesProcessed,
-      tickersFound,
+      articlesProcessed: crawlStats.totalNewArticles,
+      tickersFound: tickerResult.tickers.length,
       recommendationsGenerated: recommendations.length,
       predictionsUpdated,
       errors,
     };
   } catch (err) {
+    // Do NOT clear cache on failure — allows resume on next run
     const msg = err instanceof Error ? err.message : String(err);
     failJobExecution(jobId, msg);
-    console.error(`\n❌ ${schedule} analysis failed: ${msg}`);
+    console.error(`\n${schedule} analysis failed: ${msg}`);
 
     return {
       success: false,
@@ -307,7 +330,6 @@ export async function runDailyAnalysis(schedule: JobSchedule, force: boolean = f
 
 // CLI entry point
 if (import.meta.main) {
-  // Ensure migrations (like order_type column) are applied
   initDatabase();
 
   const args = process.argv.slice(2);
