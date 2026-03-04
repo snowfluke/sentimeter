@@ -64,7 +64,7 @@ export function AvoidSection({ items }: AvoidSectionProps) {
                   <td className="px-3 py-2 text-right text-gray-700">
                     {item.overallScore.toFixed(0)}
                   </td>
-                  <td className="px-3 py-2 text-gray-600 text-xs max-w-xs truncate">
+                  <td className="px-3 py-2 text-gray-600 text-xs max-w-xs truncate" title={item.analysisSummary}>
                     {item.analysisSummary}
                   </td>
                 </tr>

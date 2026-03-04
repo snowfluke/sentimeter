@@ -73,7 +73,7 @@ export function RecommendationCard({ recommendation: rec }: RecommendationCardPr
       </div>
 
       <div className="border-t pt-4">
-        <p className="text-sm text-gray-600 line-clamp-3">{rec.analysisSummary}</p>
+        <p className="text-sm text-gray-600 line-clamp-3" title={rec.analysisSummary}>{rec.analysisSummary}</p>
       </div>
 
       <div className="mt-3 p-2 bg-primary-50 rounded text-sm text-primary-700">
