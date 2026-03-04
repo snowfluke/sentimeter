@@ -55,7 +55,7 @@ export function LogPanel({ logs, connected, visible = false }: LogPanelProps) {
       </div>
       <div
         ref={containerRef}
-        className="p-4 max-h-64 overflow-y-auto font-mono text-sm space-y-1"
+        className="p-4 max-h-96 overflow-y-auto font-mono text-sm space-y-1 scroll-smooth"
       >
         {logs.length === 0 ? (
           <div className="text-gray-500 text-center py-4">

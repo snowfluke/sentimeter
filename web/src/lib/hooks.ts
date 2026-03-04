@@ -110,52 +110,84 @@ export function useRefresh(): {
   return { trigger, loading, result };
 }
 
+// Global log store — persists across component mounts/navigation
+let _globalLogs: LogEntry[] = [];
+let _globalConnected = false;
+let _globalEventSource: EventSource | null = null;
+let _globalListeners = new Set<() => void>();
+
+function _initGlobalLogStream(): void {
+  if (_globalEventSource) return; // Already initialized
+
+  const eventSource = new EventSource("/api/logs");
+  _globalEventSource = eventSource;
+
+  eventSource.onopen = () => {
+    _globalConnected = true;
+    _globalListeners.forEach((fn) => fn());
+  };
+
+  eventSource.onmessage = (event) => {
+    try {
+      const data = JSON.parse(event.data) as { type: string } & Partial<LogEntry>;
+      if (data.type === "log" && data.level && data.message) {
+        const entry: LogEntry = {
+          timestamp: data.timestamp ?? new Date().toISOString(),
+          level: data.level,
+          message: data.message,
+          step: data.step,
+          totalSteps: data.totalSteps,
+        };
+        // Deduplicate by timestamp + message (SSE replays on reconnect)
+        const isDupe = _globalLogs.some(
+          (l) => l.timestamp === entry.timestamp && l.message === entry.message
+        );
+        if (!isDupe) {
+          _globalLogs = [..._globalLogs, entry];
+          _globalListeners.forEach((fn) => fn());
+        }
+      }
+    } catch {
+      // Ignore parse errors
+    }
+  };
+
+  eventSource.onerror = () => {
+    _globalConnected = false;
+    _globalListeners.forEach((fn) => fn());
+  };
+}
+
 export function useLogStream(): {
   logs: LogEntry[];
   connected: boolean;
   clear: () => void;
 } {
-  const [logs, setLogs] = useState<LogEntry[]>([]);
-  const [connected, setConnected] = useState(false);
-  const eventSourceRef = useRef<EventSource | null>(null);
+  const [logs, setLogs] = useState<LogEntry[]>(_globalLogs);
+  const [connected, setConnected] = useState(_globalConnected);
 
   useEffect(() => {
-    const eventSource = new EventSource("/api/logs");
-    eventSourceRef.current = eventSource;
+    _initGlobalLogStream();
 
-    eventSource.onopen = () => {
-      setConnected(true);
-    };
+    // Sync initial state
+    setLogs(_globalLogs);
+    setConnected(_globalConnected);
 
-    eventSource.onmessage = (event) => {
-      try {
-        const data = JSON.parse(event.data) as { type: string } & Partial<LogEntry>;
-        if (data.type === "log" && data.level && data.message) {
-          const entry: LogEntry = {
-            timestamp: data.timestamp ?? new Date().toISOString(),
-            level: data.level,
-            message: data.message,
-            step: data.step,
-            totalSteps: data.totalSteps,
-          };
-          setLogs((prev) => [...prev, entry]);
-        }
-      } catch {
-        // Ignore parse errors
-      }
+    // Subscribe to updates
+    const listener = () => {
+      setLogs(_globalLogs);
+      setConnected(_globalConnected);
     };
-
-    eventSource.onerror = () => {
-      setConnected(false);
-    };
+    _globalListeners.add(listener);
 
     return () => {
-      eventSource.close();
+      _globalListeners.delete(listener);
     };
   }, []);
 
   const clear = useCallback(() => {
-    setLogs([]);
+    _globalLogs = [];
+    _globalListeners.forEach((fn) => fn());
   }, []);
 
   return { logs, connected, clear };
