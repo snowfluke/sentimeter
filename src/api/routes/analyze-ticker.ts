@@ -5,8 +5,11 @@
  *
  * Useful when the job failed to parse some ticker data.
  * Fetches news, technical, and fundamental data then runs LLM analysis.
+ * Results are cached for 24 hours per ticker.
  */
 
+import { join } from "path";
+import { mkdirSync } from "fs";
 import { jsonResponse } from "../middleware/cors.ts";
 import { successResponse, errorResponse } from "../types.ts";
 import { analyzeStock } from "../../lib/analyzer/stock-analyzer.ts";
@@ -22,6 +25,55 @@ import {
   upsertStockFundamental,
 } from "../../lib/database/queries.ts";
 import { getTrackedPredictions } from "../../lib/prediction-tracker/updater.ts";
+
+// ============================================================================
+// Cache
+// ============================================================================
+
+const CACHE_DIR = join(import.meta.dir, "../../../data/ticker-analysis-cache");
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+interface CacheEntry {
+  cachedAt: string;
+  data: TickerAnalysisResponse;
+}
+
+function ensureCacheDir(): void {
+  mkdirSync(CACHE_DIR, { recursive: true });
+}
+
+function getCachePath(ticker: string): string {
+  return join(CACHE_DIR, `${ticker.replace(/\./g, "_")}.json`);
+}
+
+async function getCachedAnalysis(ticker: string): Promise<TickerAnalysisResponse | null> {
+  try {
+    const file = Bun.file(getCachePath(ticker));
+    if (!(await file.exists())) return null;
+
+    const entry = (await file.json()) as CacheEntry;
+    const age = Date.now() - new Date(entry.cachedAt).getTime();
+
+    if (age > CACHE_TTL_MS) return null;
+
+    return entry.data;
+  } catch {
+    return null;
+  }
+}
+
+async function setCachedAnalysis(ticker: string, data: TickerAnalysisResponse): Promise<void> {
+  ensureCacheDir();
+  const entry: CacheEntry = {
+    cachedAt: new Date().toISOString(),
+    data,
+  };
+  await Bun.write(getCachePath(ticker), JSON.stringify(entry, null, 2));
+}
+
+// ============================================================================
+// Types
+// ============================================================================
 
 interface AnalyzeTickerRequest {
   ticker: string;
@@ -69,21 +121,77 @@ interface TickerAnalysisResponse {
     fundamentalSummary: string;
     technicalSummary: string;
   } | null;
+  cached?: boolean;
 }
+
+// ============================================================================
+// User-Friendly Error Messages
+// ============================================================================
+
+function toUserFriendlyError(error: unknown, ticker: string): string {
+  const msg = error instanceof Error ? error.message : String(error);
+  const lower = msg.toLowerCase();
+
+  if (lower.includes("not found") || lower.includes("404") || lower.includes("no results")) {
+    return `Ticker "${ticker}" was not found. Please check the ticker symbol and try again.`;
+  }
+  if (lower.includes("timeout") || lower.includes("timed out") || lower.includes("econnreset")) {
+    return `The request timed out while fetching data for "${ticker}". The market data service may be slow — please try again in a moment.`;
+  }
+  if (lower.includes("network") || lower.includes("fetch") || lower.includes("enotfound")) {
+    return `Could not connect to the market data service. Please check your internet connection and try again.`;
+  }
+  if (lower.includes("rate limit") || lower.includes("429") || lower.includes("too many")) {
+    return `Too many requests — the market data service is rate-limiting us. Please wait a minute and try again.`;
+  }
+  if (lower.includes("json") || lower.includes("parse") || lower.includes("unexpected token")) {
+    return `Received an unexpected response from the market data service for "${ticker}". Please try again later.`;
+  }
+  if (lower.includes("api key") || lower.includes("unauthorized") || lower.includes("403")) {
+    return `Authentication error with the market data service. Please contact the administrator.`;
+  }
+
+  // Generic fallback
+  return `Something went wrong while analyzing "${ticker}". Please try again later.`;
+}
+
+// ============================================================================
+// Route Handler
+// ============================================================================
 
 export async function handleAnalyzeTicker(request: Request): Promise<Response> {
   const origin = request.headers.get("Origin");
 
+  let rawTicker = "";
   try {
     const body = (await request.json()) as AnalyzeTickerRequest;
-    const rawTicker = body.ticker?.trim()?.toUpperCase();
+    rawTicker = body.ticker?.trim()?.toUpperCase() ?? "";
+  } catch {
+    return jsonResponse(
+      errorResponse("Invalid request. Please provide a valid JSON body with a 'ticker' field."),
+      400,
+      origin
+    );
+  }
 
-    if (!rawTicker) {
-      return jsonResponse(errorResponse("Missing 'ticker' in request body"), 400, origin);
+  if (!rawTicker) {
+    return jsonResponse(
+      errorResponse("Please enter a ticker symbol (e.g. BBCA, TLKM, ASII)."),
+      400,
+      origin
+    );
+  }
+
+  // Append .JK suffix for IDX tickers if not already present
+  const ticker = rawTicker.includes(".") ? rawTicker : `${rawTicker}.JK`;
+
+  try {
+    // Check cache first
+    const cached = await getCachedAnalysis(ticker);
+    if (cached) {
+      console.log(`Ticker analysis cache hit: ${ticker}`);
+      return jsonResponse(successResponse({ ...cached, cached: true }), 200, origin);
     }
-
-    // Append .JK suffix for IDX tickers if not already present
-    const ticker = rawTicker.includes(".") ? rawTicker : `${rawTicker}.JK`;
 
     // Fetch all data in parallel
     const [quoteResult, fundamentalsResult, historyResult] = await Promise.all([
@@ -94,7 +202,7 @@ export async function handleAnalyzeTicker(request: Request): Promise<Response> {
 
     if (!quoteResult.success || !quoteResult.data) {
       return jsonResponse(
-        errorResponse(`Failed to fetch quote for ${ticker}: ${quoteResult.error}`),
+        errorResponse(`Could not find market data for "${rawTicker}". Please verify the ticker symbol is correct and listed on IDX.`),
         404,
         origin
       );
@@ -246,13 +354,17 @@ export async function handleAnalyzeTicker(request: Request): Promise<Response> {
           },
       relevantNews,
       analysis: analysisResult,
+      cached: false,
     };
 
-    console.log("Ticker analysis response:", response);
+    // Cache the successful result
+    await setCachedAnalysis(ticker, response);
+
+    console.log(`Ticker analysis completed: ${ticker}`);
     return jsonResponse(successResponse(response), 200, origin);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    console.error("Analyze ticker error:", message);
-    return jsonResponse(errorResponse(message), 500, origin);
+    const friendlyMessage = toUserFriendlyError(error, rawTicker);
+    console.error("Analyze ticker error:", error instanceof Error ? error.message : error);
+    return jsonResponse(errorResponse(friendlyMessage), 500, origin);
   }
 }
