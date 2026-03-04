@@ -18,7 +18,7 @@ Your task is to analyze stocks and provide trading recommendations with specific
 Guidelines:
 - Be conservative with recommendations - only BUY if there's clear upside
 - Entry price should be at a good technical level (support, pullback)
-- Stop loss should be below key support (typically 3-7% below entry)
+- Stop loss MUST be at least 3% below entry price (minimum). Typically 3-7% below entry, below key support
 - Target should have 2:1 or better risk/reward ratio
 - Max hold days depends on the setup (swing: 5-14 days, position: 14-30 days)
 - Score each factor 0-100 based on strength of signal
@@ -185,12 +185,16 @@ function transformResponse(
   ticker: string,
   response: StockAnalysisResponse
 ): StockAnalysisResult {
+  // Enforce minimum 3% stop loss below entry price for fair balance with take profit
+  const minStopLoss = response.entryPrice * 0.97;
+  const stopLoss = Math.min(response.stopLoss, minStopLoss);
+
   return {
     ticker,
     action: response.action,
     confidence: clamp(response.confidence, 1, 10),
     entryPrice: response.entryPrice,
-    stopLoss: response.stopLoss,
+    stopLoss,
     targetPrice: response.targetPrice,
     maxHoldDays: response.maxHoldDays,
     orderType: response.orderType ?? "LIMIT",
