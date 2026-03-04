@@ -16,6 +16,7 @@ import type { RefreshResponse } from "../types.ts";
 import { errorResponse, successResponse } from "../types.ts";
 import { logEmitter } from "../log-emitter.ts";
 import { runAnalysisWithLogging } from "./analysis-runner.ts";
+import { getWibDateString } from "../../lib/wib.ts";
 
 export async function handleRefresh(request: Request): Promise<Response> {
   const origin = request.headers.get("Origin");
@@ -23,6 +24,7 @@ export async function handleRefresh(request: Request): Promise<Response> {
   try {
     // Check if job is already running
     if (logEmitter.isRunning()) {
+      logEmitter.info(`Analysis already in progress (Job ID: ${logEmitter.getJobId()}).`);
       const response: RefreshResponse = {
         triggered: false,
         schedule: "morning",
@@ -43,7 +45,7 @@ export async function handleRefresh(request: Request): Promise<Response> {
     if (hour === 24) hour = 0; // Intl format sometimes returns 24 for 00:00
 
     const schedule: JobSchedule = hour < 12 ? "morning" : "evening";
-    const today = new Date().toISOString().slice(0, 10);
+    const today = getWibDateString();
 
     // Parse query params for force flag
     const url = new URL(request.url);
@@ -51,6 +53,7 @@ export async function handleRefresh(request: Request): Promise<Response> {
 
     // Check if already run today (unless force)
     if (!force && hasJobRunToday(schedule)) {
+      logEmitter.info(`${schedule} analysis already completed for today. Use force to re-run.`);
       const response: RefreshResponse = {
         triggered: false,
         schedule,
